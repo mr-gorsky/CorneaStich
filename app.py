@@ -3,139 +3,119 @@ import cv2
 import numpy as np
 from PIL import Image
 
-st.set_page_config(page_title="Corneal Topography Mosaic", layout="wide")
+st.set_page_config(layout="wide")
 
-st.image("Phantasmed-logo.png", width=300)
+st.image("Phantasmed-logo.png", width=350)
 
-st.title("Corneal Topography Peripheral Mosaic")
-
-st.markdown(
-"""
-### Research Tool
-
-This application generates an **extended corneal topography mosaic**
-from multiple fixation Placido images.
-
-Images required:
-
-- central
-- up
-- down
-- left
-- right
-
-The algorithm crops the corneal map and generates an approximate mosaic
-of peripheral corneal curvature.
-
-"""
-)
+st.title("Peripheral Corneal Topography Mosaic")
 
 st.warning(
 """
-**DISCLAIMER**
+DISCLAIMER
 
-This software is an experimental research tool developed for the study:
+This software is an experimental research prototype developed for the study:
 
-*Peripheral Corneal Topography Reconstruction using Multi-Fixation Placido Imaging*
+'Peripheral Corneal Topography Reconstruction using Multi-Fixation Placido Imaging'
 
-It is **NOT intended for clinical decision making** and must not be used
-for diagnosis or treatment planning.
+The output is an approximate visualization and MUST NOT be used for
+clinical diagnosis or treatment decisions.
 """
 )
 
-st.header("Upload Images")
+st.header("Upload topography images")
 
-col1, col2, col3, col4, col5 = st.columns(5)
+c1,c2,c3,c4,c5 = st.columns(5)
 
-with col1:
-    central_file = st.file_uploader("Central", type=["jpg","png"])
-
-with col2:
-    up_file = st.file_uploader("Up (gaze up)", type=["jpg","png"])
-
-with col3:
-    down_file = st.file_uploader("Down (gaze down)", type=["jpg","png"])
-
-with col4:
-    left_file = st.file_uploader("Left (gaze left)", type=["jpg","png"])
-
-with col5:
-    right_file = st.file_uploader("Right (gaze right)", type=["jpg","png"])
+central_file = c1.file_uploader("central", type=["jpg","png"])
+up_file = c2.file_uploader("up", type=["jpg","png"])
+down_file = c3.file_uploader("down", type=["jpg","png"])
+left_file = c4.file_uploader("left", type=["jpg","png"])
+right_file = c5.file_uploader("right", type=["jpg","png"])
 
 
-def load_image(file):
-    image = Image.open(file)
-    return np.array(image)
+def read_img(file):
+    img = Image.open(file)
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
 
-def crop_corneal_map(img):
+def crop_map(img):
 
-    h, w = img.shape[:2]
+    h,w = img.shape[:2]
 
-    # central crop region (removes legends)
-    x1 = int(w * 0.25)
-    x2 = int(w * 0.75)
+    x1 = int(w*0.20)
+    x2 = int(w*0.80)
 
-    y1 = int(h * 0.1)
-    y2 = int(h * 0.9)
+    y1 = int(h*0.05)
+    y2 = int(h*0.95)
 
-    crop = img[y1:y2, x1:x2]
-
-    return crop
+    return img[y1:y2, x1:x2]
 
 
-def build_mosaic(images):
+def align_image(base, img):
 
-    base = images["central"]
+    orb = cv2.ORB_create(5000)
 
-    h, w = base.shape[:2]
+    g1 = cv2.cvtColor(base, cv2.COLOR_BGR2GRAY)
+    g2 = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    canvas = np.zeros((h*3, w*3, 3), dtype=np.uint8)
+    kp1, des1 = orb.detectAndCompute(g1,None)
+    kp2, des2 = orb.detectAndCompute(g2,None)
 
-    cx = w
-    cy = h
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
-    canvas[cy:cy+h, cx:cx+w] = base
+    matches = bf.match(des1,des2)
 
-    canvas[0:h, cx:cx+w] = images["down"]   # superior cornea
-    canvas[h*2:h*3, cx:cx+w] = images["up"] # inferior cornea
+    matches = sorted(matches,key=lambda x:x.distance)
 
-    canvas[cy:cy+h, 0:w] = images["right"]  # nasal
-    canvas[cy:cy+h, w*2:w*3] = images["left"] # temporal
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in matches[:200]]).reshape(-1,1,2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches[:200]]).reshape(-1,1,2)
 
-    return canvas
+    H,_ = cv2.findHomography(dst_pts,src_pts,cv2.RANSAC,5.0)
+
+    h,w = base.shape[:2]
+
+    aligned = cv2.warpPerspective(img,H,(w,h))
+
+    return aligned
+
+
+def blend(base,img):
+
+    mask = (img>0)
+
+    base[mask] = img[mask]
+
+    return base
 
 
 if st.button("Generate Mosaic"):
 
-    if None in [central_file, up_file, down_file, left_file, right_file]:
+    if None in [central_file,up_file,down_file,left_file,right_file]:
 
-        st.error("Upload all 5 images.")
+        st.error("Upload all 5 images")
 
     else:
 
-        central = crop_corneal_map(load_image(central_file))
-        up = crop_corneal_map(load_image(up_file))
-        down = crop_corneal_map(load_image(down_file))
-        left = crop_corneal_map(load_image(left_file))
-        right = crop_corneal_map(load_image(right_file))
+        central = crop_map(read_img(central_file))
+        up = crop_map(read_img(up_file))
+        down = crop_map(read_img(down_file))
+        left = crop_map(read_img(left_file))
+        right = crop_map(read_img(right_file))
 
-        images = {
-            "central": central,
-            "up": up,
-            "down": down,
-            "left": left,
-            "right": right
-        }
+        mosaic = central.copy()
 
-        mosaic = build_mosaic(images)
+        for img in [up,down,left,right]:
 
-        st.image(mosaic, caption="Generated Corneal Mosaic")
+            aligned = align_image(mosaic,img)
 
-        result = Image.fromarray(mosaic)
+            mosaic = blend(mosaic,aligned)
+
+        st.image(cv2.cvtColor(mosaic,cv2.COLOR_BGR2RGB))
+
+        result = Image.fromarray(cv2.cvtColor(mosaic,cv2.COLOR_BGR2RGB))
 
         st.download_button(
-            label="Download Mosaic",
+            "Download Mosaic",
             data=result.tobytes(),
             file_name="corneal_mosaic.png",
             mime="image/png"
