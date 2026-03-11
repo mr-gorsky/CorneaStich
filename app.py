@@ -30,8 +30,32 @@ with col_title:
 
 st.markdown("---")
 
+def load_image(uploaded_file):
+    """Pouzdano učitavanje slike iz uploadanog fajla"""
+    if uploaded_file is not None:
+        # Pročitaj bytes
+        bytes_data = uploaded_file.read()
+        if len(bytes_data) == 0:
+            return None
+        
+        # Konvertiraj u numpy array
+        nparr = np.frombuffer(bytes_data, np.uint8)
+        
+        # Dekodiraj sliku
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if img is not None:
+            # Konvertiraj BGR u RGB
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            return img_rgb
+    
+    return None
+
 def crop_to_circle(image):
     """Izreži samo kružni dio topografske mape"""
+    if image is None:
+        return None, None
+        
     gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     _, thresh = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
     
@@ -43,16 +67,14 @@ def crop_to_circle(image):
         center = (int(x), int(y))
         radius = int(radius)
         
-        # Napravi masku s mekim rubom za bolje spajanje
+        # Napravi masku
         mask = np.zeros(image.shape[:2], dtype=np.uint8)
         cv2.circle(mask, center, radius, 255, -1)
         
-        # Dodaj mali blur na rub za glatko spajanje
-        mask = cv2.GaussianBlur(mask, (5, 5), 0)
-        
+        # Izreži
         result = cv2.bitwise_and(image, image, mask=mask)
         
-        # Izreži na bounding box kruga
+        # Bounding box
         y1 = max(0, center[1] - radius)
         y2 = min(image.shape[0], center[1] + radius)
         x1 = max(0, center[0] - radius)
@@ -62,147 +84,21 @@ def crop_to_circle(image):
     
     return None, None
 
-def find_overlap_and_stitch(img1, img2, direction):
-    """Pronađi preklapanje i spoji dvije slike"""
-    # Pretvori u grayscale za detekciju značajki
-    gray1 = cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY)
-    gray2 = cv2.cvtColor(img2, cv2.COLOR_RGB2GRAY)
-    
-    # Detekcija značajki (krvne žile, rubovi, uzorci)
-    sift = cv2.SIFT_create()
-    
-    keypoints1, descriptors1 = sift.detectAndCompute(gray1, None)
-    keypoints2, descriptors2 = sift.detectAndCompute(gray2, None)
-    
-    if descriptors1 is None or descriptors2 is None:
-        return None
-    
-    # FLANN matcher za brzo prepoznavanje
-    FLANN_INDEX_KDTREE = 1
-    index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
-    search_params = dict(checks=50)
-    
-    flann = cv2.FlannBasedMatcher(index_params, search_params)
-    matches = flann.knnMatch(descriptors1, descriptors2, k=2)
-    
-    # Lowe's ratio test za dobra preklapanja
-    good_matches = []
-    for match_pair in matches:
-        if len(match_pair) == 2:
-            m, n = match_pair
-            if m.distance < 0.7 * n.distance:
-                good_matches.append(m)
-    
-    if len(good_matches) < 10:
-        # Ako nema dovoljno preklapanja, pokušaj jednostavniji pristup
-        return simple_stitch(img1, img2, direction)
-    
-    # Pronađi homografiju
-    src_pts = np.float32([keypoints1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-    dst_pts = np.float32([keypoints2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-    
-    H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-    
-    if H is None:
-        return simple_stitch(img1, img2, direction)
-    
-    # Spoji slike
-    h1, w1 = img1.shape[:2]
-    h2, w2 = img2.shape[:2]
-    
-    # Transformiraj prvu sliku u prostor druge
-    result = cv2.warpPerspective(img1, H, (w1 + w2, max(h1, h2)))
-    result[0:h2, 0:w2] = img2
-    
-    # Izreži prazan prostor
-    gray_result = cv2.cvtColor(result, cv2.COLOR_RGB2GRAY)
-    non_empty = np.where(gray_result > 0)
-    if len(non_empty[0]) > 0:
-        y_min, y_max = np.min(non_empty[0]), np.max(non_empty[0])
-        x_min, x_max = np.min(non_empty[1]), np.max(non_empty[1])
-        result = result[y_min:y_max+1, x_min:x_max+1]
-    
-    return result
-
-def simple_stitch(img1, img2, direction):
-    """Fallback metoda ako feature matching ne radi"""
-    h1, w1 = img1.shape[:2]
-    h2, w2 = img2.shape[:2]
-    
-    # Pronađi preklapanje pomoću korelacije
-    gray1 = cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY)
-    gray2 = cv2.cvtColor(img2, cv2.COLOR_RGB2GRAY)
-    
-    # Ograniči pretragu na očekivano područje preklapanja
-    if direction in ['left', 'right']:
-        search_width = min(w1, w2) // 3
-        if direction == 'right':  # img2 je desno od img1
-            template = gray1[:, -search_width:]
-            result = cv2.matchTemplate(gray2[:, :search_width*2], template, cv2.TM_CCOEFF_NORMED)
-        else:  # img2 je lijevo od img1
-            template = gray1[:, :search_width]
-            result = cv2.matchTemplate(gray2[:, -search_width*2:], template, cv2.TM_CCOEFF_NORMED)
-    else:  # gore/dolje
-        search_height = min(h1, h2) // 3
-        if direction == 'down':  # img2 je dolje od img1
-            template = gray1[-search_height:, :]
-            result = cv2.matchTemplate(gray2[:search_height*2, :], template, cv2.TM_CCOEFF_NORMED)
-        else:  # img2 je gore od img1
-            template = gray1[:search_height, :]
-            result = cv2.matchTemplate(gray2[-search_height*2:, :], template, cv2.TM_CCOEFF_NORMED)
-    
-    _, max_val, _, max_loc = cv2.minMaxLoc(result)
-    
-    if max_val < 0.3:  # Ako nema dobrog preklapanja
-        # Jednostavno stavi jednu pored druge
-        if direction in ['left', 'right']:
-            result_img = np.zeros((max(h1, h2), w1 + w2, 3), dtype=np.uint8)
-            result_img[:h1, :w1] = img1
-            if direction == 'right':
-                result_img[:h2, w1:w1+w2] = img2
-            else:
-                result_img[:h2, :w2] = img2
-                result_img[:h1, w2:w2+w1] = img1
-        else:
-            result_img = np.zeros((h1 + h2, max(w1, w2), 3), dtype=np.uint8)
-            result_img[:h1, :w1] = img1
-            if direction == 'down':
-                result_img[h1:h1+h2, :w2] = img2
-            else:
-                result_img[:h2, :w2] = img2
-                result_img[h2:h2+h1, :w1] = img1
-    else:
-        # Spoji s pronađenim preklapanjem
-        if direction in ['left', 'right']:
-            overlap = max_loc[0] if direction == 'right' else w2 - max_loc[0]
-            result_img = np.zeros((max(h1, h2), w1 + w2 - overlap, 3), dtype=np.uint8)
-            # Linearno blendanje u zoni preklapanja
-            # (pojednostavljeno za sada)
-            if direction == 'right':
-                result_img[:h1, :w1] = img1
-                result_img[:h2, w1-overlap:w1-overlap+w2] = img2
-            else:
-                result_img[:h2, :w2] = img2
-                result_img[:h1, w2-overlap:w2-overlap+w1] = img1
-        else:
-            overlap = max_loc[1] if direction == 'down' else h2 - max_loc[1]
-            result_img = np.zeros((h1 + h2 - overlap, max(w1, w2), 3), dtype=np.uint8)
-            if direction == 'down':
-                result_img[:h1, :w1] = img1
-                result_img[h1-overlap:h1-overlap+h2, :w2] = img2
-            else:
-                result_img[:h2, :w2] = img2
-                result_img[h2-overlap:h2-overlap+h1, :w1] = img1
-    
-    return result_img
-
 def add_scale_bar(image, hvid_mm):
     """Dodaj skalu na osnovu HVID-a"""
+    if image is None:
+        return image
+        
     h, w = image.shape[:2]
     mm_per_pixel = hvid_mm / w
     
-    # Skala od 2 mm (stavi na dno)
+    # Skala od 2 mm
     scale_length_px = int(2 / mm_per_pixel)
+    if scale_length_px < 20:  # Ako je 2mm premalo, koristi 5mm
+        scale_length_px = int(5 / mm_per_pixel)
+        scale_text = "5 mm"
+    else:
+        scale_text = "2 mm"
     
     margin = 30
     y_start = h - margin - 10
@@ -216,7 +112,6 @@ def add_scale_bar(image, hvid_mm):
     cv2.rectangle(image, (x_start, y_start), (x_end, y_end), (0, 0, 0), -1)
     
     # Tekst
-    scale_text = f"2 mm"
     cv2.putText(image, scale_text, (x_start, y_start-5), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
     
@@ -224,6 +119,9 @@ def add_scale_bar(image, hvid_mm):
 
 def add_quadrant_labels(image):
     """Dodaj oznake kvadranata"""
+    if image is None:
+        return image
+        
     h, w = image.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 0.8
@@ -233,12 +131,11 @@ def add_quadrant_labels(image):
     
     margin = 40
     
-    # Pozicije
     labels = {
-        'S': (w//2, margin),      # Superior (gore)
-        'I': (w//2, h - margin),   # Inferior (dolje)
-        'N': (margin, h//2),       # Nasal (lijevo)
-        'T': (w - margin, h//2)     # Temporal (desno)
+        'S': (w//2, margin),
+        'I': (w//2, h - margin),
+        'N': (margin, h//2),
+        'T': (w - margin, h//2)
     }
     
     for label, (x, y) in labels.items():
@@ -252,61 +149,63 @@ def add_quadrant_labels(image):
     
     return image
 
-def create_panorama(images_dict, is_left_eye):
-    """Kreiraj panoramu postupnim spajanjem"""
+def create_simple_mosaic(images_dict, eye_side):
+    """Napravi jednostavan mozaik od dostupnih slika"""
     if 'Central fix' not in images_dict:
         return None
     
-    # Počni sa centralnom
-    panorama = images_dict['Central fix'].copy()
-    h, w = panorama.shape[:2]
+    central = images_dict['Central fix']
+    h, w = central.shape[:2]
     
-    # Definiraj redoslijed spajanja i smjerove
-    if is_left_eye:
-        order = [
-            ('Right fix', 'left'),   # nazalno dolazi s lijeve strane
-            ('Left fix', 'right'),    # temporalno s desne
-            ('Up fix', 'up'),         # gore
-            ('Down fix', 'down')       # dolje
-        ]
+    # Definiraj pozicije
+    positions = {
+        'Central fix': (h, w),  # centar
+    }
+    
+    if eye_side == "Left eye (OS)":
+        # Za lijevo oko
+        if 'Right fix' in images_dict:  # nazalno (lijevo)
+            positions['Right fix'] = (h, 0)
+        if 'Left fix' in images_dict:   # temporalno (desno)
+            positions['Left fix'] = (h, 2*w)
+        if 'Up fix' in images_dict:      # gore (superior) - zapravo snima dolje
+            positions['Up fix'] = (0, w)
+        if 'Down fix' in images_dict:    # dolje (inferior) - zapravo snima gore
+            positions['Down fix'] = (2*h, w)
     else:
-        order = [
-            ('Left fix', 'left'),     # za desno oko, nazalno je lijevo
-            ('Right fix', 'right'),    # temporalno desno
-            ('Up fix', 'up'),
-            ('Down fix', 'down')
-        ]
+        # Za desno oko
+        if 'Left fix' in images_dict:    # nazalno (lijevo)
+            positions['Left fix'] = (h, 0)
+        if 'Right fix' in images_dict:   # temporalno (desno)
+            positions['Right fix'] = (h, 2*w)
+        if 'Up fix' in images_dict:       # gore
+            positions['Up fix'] = (0, w)
+        if 'Down fix' in images_dict:     # dolje
+            positions['Down fix'] = (2*h, w)
     
-    status_messages = []
+    # Napravi canvas
+    canvas = np.ones((h*3, w*3, 3), dtype=np.uint8) * 255
     
-    for img_name, direction in order:
-        if img_name in images_dict:
-            img = images_dict[img_name]
-            status_messages.append(f"Spajam {img_name} ({direction})")
-            
-            # Spoji prema smjeru
-            if direction == 'left':
-                # Slika treba biti lijevo od panorame
-                stitched = find_overlap_and_stitch(img, panorama, 'right')
-                if stitched is not None:
-                    panorama = stitched
-            elif direction == 'right':
-                # Slika treba biti desno od panorame
-                stitched = find_overlap_and_stitch(panorama, img, 'right')
-                if stitched is not None:
-                    panorama = stitched
-            elif direction == 'up':
-                # Slika treba biti gore
-                stitched = find_overlap_and_stitch(img, panorama, 'down')
-                if stitched is not None:
-                    panorama = stitched
-            elif direction == 'down':
-                # Slika treba biti dolje
-                stitched = find_overlap_and_stitch(panorama, img, 'down')
-                if stitched is not None:
-                    panorama = stitched
+    # Postavi centralnu
+    canvas[h:h*2, w:w*2] = central
     
-    return panorama, status_messages
+    # Postavi ostale
+    for name, (y, x) in positions.items():
+        if name != 'Central fix' and name in images_dict:
+            img = images_dict[name]
+            if img.shape[0] != h or img.shape[1] != w:
+                img = cv2.resize(img, (w, h))
+            canvas[y:y+h, x:x+w] = img
+    
+    # Izreži prazan prostor
+    gray = cv2.cvtColor(canvas, cv2.COLOR_RGB2GRAY)
+    non_empty = np.where(gray < 254)  # nije bijelo
+    if len(non_empty[0]) > 0:
+        y_min, y_max = np.min(non_empty[0]), np.max(non_empty[0])
+        x_min, x_max = np.min(non_empty[1]), np.max(non_empty[1])
+        canvas = canvas[y_min:y_max+1, x_min:x_max+1]
+    
+    return canvas
 
 # Streamlit UI
 col1, col2 = st.columns([1, 2])
@@ -314,8 +213,13 @@ col1, col2 = st.columns([1, 2])
 with col1:
     st.header("Settings")
     
-    is_left_eye = st.checkbox("Left eye (OS)", value=True, 
-                              help="Check for left eye (OS), uncheck for right eye (OD)")
+    # Izbor oka - sada radi za oba!
+    eye_side = st.radio(
+        "Select eye",
+        ["Left eye (OS)", "Right eye (OD)"],
+        index=0,
+        help="Choose left or right eye - orientation will be adjusted automatically"
+    )
     
     hvid_input = st.number_input("HVID (mm)", 
                                  min_value=10.0, max_value=14.0, value=11.5, step=0.1,
@@ -327,39 +231,49 @@ with col1:
     with st.expander("📖 Instructions", expanded=False):
         st.markdown("""
         **Fixation guide:**
-        - **Central fix** - straight ahead (central map)
-        - **Up fix** - patient looks **UP** (images **INFERIOR**)
-        - **Down fix** - patient looks **DOWN** (images **SUPERIOR**)  
+        - **Central fix** - straight ahead
+        - **Up fix** - patient looks **UP** (images **INFERIOR** quadrant)
+        - **Down fix** - patient looks **DOWN** (images **SUPERIOR** quadrant)  
         - **Left fix** - patient looks **LEFT**
         - **Right fix** - patient looks **RIGHT**
         
-        The app will automatically detect overlapping areas based on blood vessels and pattern matching.
+        The app automatically adjusts orientation for left/right eye.
         """)
     
-    central = st.file_uploader("Central fix", type=['jpg', 'jpeg', 'png'], key='central')
-    up = st.file_uploader("Up fix (looks up)", type=['jpg', 'jpeg', 'png'], key='up')
-    down = st.file_uploader("Down fix (looks down)", type=['jpg', 'jpeg', 'png'], key='down')
-    left = st.file_uploader("Left fix (looks left)", type=['jpg', 'jpeg', 'png'], key='left')
-    right = st.file_uploader("Right fix (looks right)", type=['jpg', 'jpeg', 'png'], key='right')
+    # Upload fajlova - koristimo unique key za svaki
+    central_file = st.file_uploader("Central fix", type=['jpg', 'jpeg', 'png'], key='upload_central')
+    up_file = st.file_uploader("Up fix (looks up)", type=['jpg', 'jpeg', 'png'], key='upload_up')
+    down_file = st.file_uploader("Down fix (looks down)", type=['jpg', 'jpeg', 'png'], key='upload_down')
+    left_file = st.file_uploader("Left fix (looks left)", type=['jpg', 'jpeg', 'png'], key='upload_left')
+    right_file = st.file_uploader("Right fix (looks right)", type=['jpg', 'jpeg', 'png'], key='upload_right')
     
-    process = st.button("🔄 Create Peripheral Panorama", type="primary", use_container_width=True)
+    process = st.button("🔄 Create Mosaic", type="primary", use_container_width=True)
+    
+    # Debug info
+    with st.expander("🔧 Debug Info"):
+        st.write("Upload status:")
+        st.write(f"Central: {'✅' if central_file else '❌'}")
+        st.write(f"Up: {'✅' if up_file else '❌'}")
+        st.write(f"Down: {'✅' if down_file else '❌'}")
+        st.write(f"Left: {'✅' if left_file else '❌'}")
+        st.write(f"Right: {'✅' if right_file else '❌'}")
 
 with col2:
     st.header("Result")
     
     if process:
-        if central is None:
+        if central_file is None:
             st.error("⚠️ Please upload at least the central image!")
         else:
-            with st.spinner("🔄 Processing images and detecting overlap..."):
-                # Učitaj sve slike i izreži krugove
+            with st.spinner("🔄 Processing images..."):
+                # Učitaj sve slike
                 images = {}
                 files = {
-                    'Central fix': central,
-                    'Up fix': up,
-                    'Down fix': down,
-                    'Left fix': left,
-                    'Right fix': right
+                    'Central fix': central_file,
+                    'Up fix': up_file,
+                    'Down fix': down_file,
+                    'Left fix': left_file,
+                    'Right fix': right_file
                 }
                 
                 progress = st.progress(0)
@@ -368,56 +282,58 @@ with col2:
                 for i, (name, file) in enumerate(files.items()):
                     status.text(f"Processing {name}...")
                     if file:
-                        bytes_data = file.read()
-                        nparr = np.frombuffer(bytes_data, np.uint8)
-                        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                        img = load_image(file)
                         if img is not None:
-                            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                            cropped, _ = crop_to_circle(img_rgb)
+                            cropped, _ = crop_to_circle(img)
                             if cropped is not None:
                                 images[name] = cropped
+                                st.write(f"✅ {name} loaded: {cropped.shape}")
+                            else:
+                                st.write(f"⚠️ {name} - could not crop circle")
+                        else:
+                            st.write(f"⚠️ {name} - could not load image")
                     progress.progress((i + 1) / len(files))
                 
-                status.text("Creating panorama with feature matching...")
+                status.text("Creating mosaic...")
                 
-                if len(images) >= 2:
-                    # Kreiraj panoramu
-                    panorama, stitch_status = create_panorama(images, is_left_eye)
+                if len(images) >= 1:
+                    # Napravi mozaik
+                    mosaic = create_simple_mosaic(images, eye_side)
                     
-                    if panorama is not None:
-                        # Dodaj skalu i oznake
-                        panorama_with_labels = add_quadrant_labels(panorama.copy())
-                        panorama_with_scale = add_scale_bar(panorama_with_labels, hvid_input)
+                    if mosaic is not None:
+                        # Dodaj oznake
+                        mosaic_with_labels = add_quadrant_labels(mosaic.copy())
+                        mosaic_with_scale = add_scale_bar(mosaic_with_labels, hvid_input)
                         
-                        st.image(panorama_with_scale, caption="Peripheral Corneal Panorama", use_container_width=True)
+                        # Prikaži
+                        st.image(mosaic_with_scale, caption="Corneal Topography Mosaic", use_container_width=True)
                         
                         # Download
-                        _, buffer = cv2.imencode('.png', cv2.cvtColor(panorama_with_scale, cv2.COLOR_RGB2BGR))
+                        mosaic_bgr = cv2.cvtColor(mosaic_with_scale, cv2.COLOR_RGB2BGR)
+                        _, buffer = cv2.imencode('.png', mosaic_bgr)
+                        
+                        eye_code = "OS" if eye_side == "Left eye (OS)" else "OD"
                         st.download_button(
-                            label="📥 Download Panorama",
+                            label="📥 Download Mosaic",
                             data=buffer.tobytes(),
-                            file_name=f"topostitcher_panorama_{'OS' if is_left_eye else 'OD'}.png",
+                            file_name=f"topostitcher_{eye_code}.png",
                             mime="image/png",
                             use_container_width=True
                         )
                         
-                        # Status
+                        # Koje slike su korištene
                         used = [n.replace(' fix', '') for n in images.keys()]
-                        st.success(f"✅ Success! Stitched: {', '.join(used)}")
-                        
-                        with st.expander("📊 Stitching Details"):
-                            for msg in stitch_status:
-                                st.write(f"• {msg}")
+                        st.success(f"✅ Success! Used: {', '.join(used)}")
                     else:
-                        st.error("❌ Could not create panorama!")
+                        st.error("❌ Could not create mosaic!")
                 else:
-                    st.error("❌ Need at least 2 images for stitching!")
+                    st.error("❌ Could not load any images!")
 
 # Footer
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: gray; padding: 10px;'>
-<b>TopoStitcher</b> v1.1 | For orientation purposes only<br>
-Uses SIFT feature matching to detect overlapping blood vessels and patterns
+<b>TopoStitcher</b> v1.2 | For orientation purposes only<br>
+© Phantasmed
 </div>
 """, unsafe_allow_html=True)
